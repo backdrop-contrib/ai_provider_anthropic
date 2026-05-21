@@ -1,0 +1,42 @@
+<?php
+
+/**
+ * Implements hook_install().
+ */
+function ai_provider_anthropic_install() {
+  if (!module_load_install('ai_upgrade')) { return []; }
+  ai_upgrade_module_install('ai_provider_anthropic');
+}
+
+/**
+ * Migrate legacy provider config from openai_anthropic to ai_provider_anthropic.
+ */
+function ai_provider_anthropic_update_1000() {
+  $old_config_name = 'openai_anthropic.settings';
+  $new_config_name = 'ai_provider_anthropic.settings';
+
+  $old = config($old_config_name);
+  $data = $old->get();
+
+  if (!empty($data)) {
+    $new = config($new_config_name);
+    $data['_config_name'] = $new_config_name;
+    $new->setData($data);
+    $new->save();
+    $old->delete();
+  }
+
+  if (module_exists('openai_anthropic')) {
+    module_disable(['openai_anthropic']);
+  }
+
+  return t('Migrated legacy anthropic configuration to AI provider anthropic.');
+}
+
+/**
+ * Implements hook_requirements().
+ */
+function ai_provider_anthropic_requirements($phase) {
+  if (!module_load_install('ai_upgrade')) { return []; }
+  return ai_upgrade_module_requirements($phase, 'ai_provider_anthropic');
+}

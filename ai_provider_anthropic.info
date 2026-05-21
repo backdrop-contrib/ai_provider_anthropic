@@ -1,0 +1,7 @@
+name = AI Provider Anthropic
+description = Anthropic Claude provider for the AI module.
+backdrop = 1.x
+type = module
+package = AI
+dependencies[] = key
+dependencies[] = ai
