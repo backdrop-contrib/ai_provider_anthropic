@@ -256,7 +256,7 @@ class AIAnthropicAdapter extends AIAdapterBase {
         $params['system'] = $system;
       }
       if (!$this->modelRejectsSamplingParams($model)) {
-        $params['temperature'] = (float) $temperature;
+        $params['temperature'] = max(0.0, min(1.0, (float) $temperature));
       }
 
       if ($stream_response) {
