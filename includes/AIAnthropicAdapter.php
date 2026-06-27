@@ -32,6 +32,34 @@ class AIAnthropicAdapter extends AIAdapterBase {
   }
 
   /**
+   * Whether a model rejects the sampling parameters.
+   *
+   * Fable 5 and Opus 4.7/4.8 removed temperature/top_p/top_k — sending any of
+   * them returns a 400. Sonnet 4.6, Opus 4.6 and earlier still accept them.
+   */
+  protected function modelRejectsSamplingParams(string $model): bool {
+    return (bool) preg_match('/(fable|opus-4-[78])/i', $model);
+  }
+
+  /**
+   * Pull system-role messages out of a shared message array.
+   *
+   * Anthropic takes the system prompt as a top-level `system` field, not as a
+   * system-role message. convertMessages() drops system messages, so callers
+   * must collect them here and set the `system` param — otherwise the persona,
+   * guardrails, and site context are silently lost.
+   */
+  protected function extractSystemPrompt(array $messages): string {
+    $system = '';
+    foreach ($messages as $msg) {
+      if (($msg['role'] ?? '') === 'system' && is_string($msg['content'] ?? NULL)) {
+        $system .= $msg['content'] . "\n";
+      }
+    }
+    return trim($system);
+  }
+
+  /**
    * {@inheritdoc}
    */
   public function getModels(): array {
@@ -103,7 +131,6 @@ class AIAnthropicAdapter extends AIAdapterBase {
       $params = [
         'model' => $model,
         'max_tokens' => (int) $max_tokens ?: 512,
-        'temperature' => (float) $temperature,
         'messages' => [
           [
             'role' => 'user',
@@ -111,6 +138,9 @@ class AIAnthropicAdapter extends AIAdapterBase {
           ],
         ],
       ];
+      if (!$this->modelRejectsSamplingParams($model)) {
+        $params['temperature'] = max(0.0, min(1.0, (float) $temperature));
+      }
 
       if ($stream_response) {
         return $this->handleStreamingResponse($params);
@@ -217,9 +247,17 @@ class AIAnthropicAdapter extends AIAdapterBase {
       $params = [
         'model' => $model,
         'max_tokens' => (int) $max_tokens ?: 1024,
-        'temperature' => (float) $temperature,
         'messages' => $anthropic_messages,
       ];
+      // convertMessages() drops system-role messages; re-inject them as the
+      // top-level system field so the persona/guardrails/site context survive.
+      $system = $this->extractSystemPrompt($messages);
+      if ($system !== '') {
+        $params['system'] = $system;
+      }
+      if (!$this->modelRejectsSamplingParams($model)) {
+        $params['temperature'] = (float) $temperature;
+      }
 
       if ($stream_response) {
         return $this->handleStreamingResponse($params);
@@ -343,7 +381,10 @@ class AIAnthropicAdapter extends AIAdapterBase {
   }
 
   protected function makeApiRequest($endpoint, array $body) {
-    return $this->makeRequest($this->baseUrl . $endpoint, $body);
+    // Only /messages generation calls go through here (model listing has its
+    // own fast-fail request); long generations need more than the 30s
+    // makeRequest() default.
+    return $this->makeRequest($this->baseUrl . $endpoint, $body, [], 'POST', 300);
   }
 
   /**
@@ -446,12 +487,75 @@ class AIAnthropicAdapter extends AIAdapterBase {
         continue;
       }
 
+      // OpenAI-shape tool results become tool_result blocks in a user turn.
+      // Consecutive results merge into one turn: Anthropic requires roles to
+      // alternate, and all results for one assistant turn belong together.
+      if ($role === 'tool') {
+        $content = $msg['content'] ?? '';
+        if (!is_string($content)) {
+          $content = json_encode($content);
+        }
+        $block = [
+          'type' => 'tool_result',
+          'tool_use_id' => (string) ($msg['tool_call_id'] ?? ''),
+          'content' => $content,
+        ];
+        $last = count($anthropic_messages) - 1;
+        if ($last >= 0
+          && $anthropic_messages[$last]['role'] === 'user'
+          && is_array($anthropic_messages[$last]['content'])
+          && (($anthropic_messages[$last]['content'][0]['type'] ?? '') === 'tool_result')) {
+          $anthropic_messages[$last]['content'][] = $block;
+        }
+        else {
+          $anthropic_messages[] = ['role' => 'user', 'content' => [$block]];
+        }
+        continue;
+      }
+
       // Convert the shared 'assistant' role to 'assistant' (Anthropic)
       $anthropic_role = ($role === 'assistant') ? 'assistant' : 'user';
+      $content = $this->convertContentAnthropic($msg['content'] ?? '');
+
+      // OpenAI-shape assistant tool_calls become tool_use blocks. Without
+      // this the calls were dropped and a text-less assistant turn became
+      // empty content, which Anthropic rejects with a 400.
+      if ($anthropic_role === 'assistant' && !empty($msg['tool_calls']) && is_array($msg['tool_calls'])) {
+        $blocks = [];
+        if (is_string($content)) {
+          if (trim($content) !== '') {
+            $blocks[] = ['type' => 'text', 'text' => $content];
+          }
+        }
+        elseif (is_array($content)) {
+          $blocks = $content;
+        }
+        foreach ($msg['tool_calls'] as $tc) {
+          $args = $tc['function']['arguments'] ?? ($tc['arguments'] ?? []);
+          if (is_string($args)) {
+            $args = json_decode($args, TRUE);
+          }
+          // 'input' must serialize as a JSON object — an empty PHP array
+          // would encode as [] and be rejected.
+          $blocks[] = [
+            'type' => 'tool_use',
+            'id' => (string) ($tc['id'] ?? ''),
+            'name' => (string) ($tc['function']['name'] ?? ($tc['name'] ?? '')),
+            'input' => is_array($args) && $args !== [] ? $args : new \stdClass(),
+          ];
+        }
+        $anthropic_messages[] = ['role' => 'assistant', 'content' => $blocks];
+        continue;
+      }
+
+      // Anthropic rejects empty message content; skip empty turns.
+      if ((is_string($content) && trim($content) === '') || (is_array($content) && $content === [])) {
+        continue;
+      }
 
       $anthropic_messages[] = [
         'role' => $anthropic_role,
-        'content' => $this->convertContentAnthropic($msg['content'] ?? ''),
+        'content' => $content,
       ];
     }
 
