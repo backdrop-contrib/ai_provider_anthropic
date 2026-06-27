@@ -34,11 +34,12 @@ class AIAnthropicAdapter extends AIAdapterBase {
   /**
    * Whether a model rejects the sampling parameters.
    *
-   * Fable 5 and Opus 4.7/4.8 removed temperature/top_p/top_k — sending any of
-   * them returns a 400. Sonnet 4.6, Opus 4.6 and earlier still accept them.
+   * Fable 5, Mythos 5, and Opus 4.7/4.8 removed temperature/top_p/top_k —
+   * sending any of them returns a 400. Sonnet 4.6, Opus 4.6 and earlier still
+   * accept them.
    */
   protected function modelRejectsSamplingParams(string $model): bool {
-    return (bool) preg_match('/(fable|opus-4-[78])/i', $model);
+    return (bool) preg_match('/(fable|mythos|opus-4-[78])/i', $model);
   }
 
   /**
@@ -52,8 +53,19 @@ class AIAnthropicAdapter extends AIAdapterBase {
   protected function extractSystemPrompt(array $messages): string {
     $system = '';
     foreach ($messages as $msg) {
-      if (($msg['role'] ?? '') === 'system' && is_string($msg['content'] ?? NULL)) {
-        $system .= $msg['content'] . "\n";
+      if (($msg['role'] ?? '') !== 'system') {
+        continue;
+      }
+      $content = $msg['content'] ?? '';
+      if (is_string($content)) {
+        $system .= $content . "\n";
+      }
+      elseif (is_array($content)) {
+        foreach ($content as $block) {
+          if (($block['type'] ?? '') === 'text' && isset($block['text'])) {
+            $system .= $block['text'] . "\n";
+          }
+        }
       }
     }
     return trim($system);
@@ -535,13 +547,16 @@ class AIAnthropicAdapter extends AIAdapterBase {
           if (is_string($args)) {
             $args = json_decode($args, TRUE);
           }
-          // 'input' must serialize as a JSON object — an empty PHP array
-          // would encode as [] and be rejected.
+          // 'input' must serialize as a JSON object — empty arrays and
+          // numeric-keyed (list) arrays would encode as [] or [...].
+          $input = (is_array($args) && !empty($args) && is_string(array_key_first($args)))
+            ? $args
+            : new \stdClass();
           $blocks[] = [
             'type' => 'tool_use',
             'id' => (string) ($tc['id'] ?? ''),
             'name' => (string) ($tc['function']['name'] ?? ($tc['name'] ?? '')),
-            'input' => is_array($args) && $args !== [] ? $args : new \stdClass(),
+            'input' => $input,
           ];
         }
         $anthropic_messages[] = ['role' => 'assistant', 'content' => $blocks];
