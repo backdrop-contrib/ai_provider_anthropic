@@ -9,28 +9,17 @@ function ai_provider_anthropic_install() {
 }
 
 /**
- * Migrate legacy provider config from openai_anthropic to ai_provider_anthropic.
+ * Copy legacy Anthropic provider configuration into the AI namespace.
+ *
+ * Non-destructive: legacy config is kept and the legacy module stays enabled
+ * until the operator completes the cutover with AI Upgrade.
  */
 function ai_provider_anthropic_update_1000() {
-  $old_config_name = 'openai_anthropic.settings';
-  $new_config_name = 'ai_provider_anthropic.settings';
-
-  $old = config($old_config_name);
-  $data = $old->get();
-
-  if (!empty($data)) {
-    $new = config($new_config_name);
-    $data['_config_name'] = $new_config_name;
-    $new->setData($data);
-    $new->save();
-    $old->delete();
+  if (!module_load_install('ai_upgrade')) {
+    return t('AI Upgrade helpers unavailable; legacy Anthropic provider configuration not migrated.');
   }
-
-  if (module_exists('openai_anthropic')) {
-    module_disable(['openai_anthropic']);
-  }
-
-  return t('Migrated legacy anthropic configuration to AI provider anthropic.');
+  $result = ai_upgrade_module_install('ai_provider_anthropic');
+  return t('Copied @count legacy Anthropic provider config object(s).', ['@count' => $result['migrated']]);
 }
 
 /**
