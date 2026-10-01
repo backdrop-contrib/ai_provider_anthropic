@@ -17,6 +17,12 @@ class AIAnthropicAdapter extends AIAdapterBase {
   /** @var string */
   protected $baseUrl = 'https://api.anthropic.com/v1';
 
+  /** @var array Capability flags returned by the Models API. */
+  protected $modelCapabilities = [];
+
+  /** @var array|null Catalog reused alongside its metadata. */
+  protected $models;
+
   public function __construct($api_key, ?AIApi $api = NULL) {
     parent::__construct($api_key, $api);
   }
@@ -75,8 +81,12 @@ class AIAnthropicAdapter extends AIAdapterBase {
    * {@inheritdoc}
    */
   public function getModels(): array {
+    if ($this->models !== NULL) {
+      return $this->models;
+    }
+    $this->modelCapabilities = [];
     try {
-      $url = $this->baseUrl . '/models';
+      $url = $this->baseUrl . '/models?limit=1000';
       $options = [
         'method' => 'GET',
         'headers' => [
@@ -104,6 +114,7 @@ class AIAnthropicAdapter extends AIAdapterBase {
             }
 
             $label = $item['display_name'] ?? $item['name'] ?? $id;
+            $this->modelCapabilities[$id] = (array) ($item['capabilities'] ?? []);
             if ($label === $id) {
               $models[$id] = $id;
             } else {
@@ -113,7 +124,7 @@ class AIAnthropicAdapter extends AIAdapterBase {
 
           if (!empty($models)) {
             asort($models);
-            return $models;
+            return $this->models = $models;
           }
         }
       }
@@ -184,14 +195,21 @@ class AIAnthropicAdapter extends AIAdapterBase {
    */
   public function getModelsByCapability($capability): array {
     $models = $this->getModels();
+    $capability = ai_normalize_capability_name($capability);
     if ($capability === 'text') {
       $filtered = $models;
     }
-    elseif ($capability === 'vision') {
+    elseif (in_array($capability, ['vision', 'tool_calling', 'thinking'], TRUE)) {
       $filtered = [];
       foreach ($models as $id => $label) {
-        // Claude 3 and later generally support vision.
-        if (preg_match('/claude-[3-9]/i', $id)) {
+        $flags = $this->modelCapabilities[$id] ?? [];
+        $flag = ['vision' => 'image_input', 'thinking' => 'thinking'][$capability] ?? NULL;
+        // Prefer explicit flags, including false. Older catalogs lack flags.
+        $supported = $flag !== NULL && isset($flags[$flag]['supported']) ? $flags[$flag]['supported'] : NULL;
+        if ($supported === NULL && $capability !== 'thinking') {
+          $supported = (bool) preg_match('/^claude-(?:[3-9]|(?:sonnet|opus|haiku|fable|mythos)-[4-9])/', $id);
+        }
+        if ($supported === TRUE) {
           $filtered[$id] = $label;
         }
       }
@@ -265,9 +283,35 @@ class AIAnthropicAdapter extends AIAdapterBase {
       // top-level system field so the persona/guardrails/site context survive.
       $system = $this->extractSystemPrompt($messages);
       if ($system !== '') {
-        $params['system'] = $system;
+        if (!empty($context_extra['prompt_caching']) || strlen($system) >= 1024) {
+          $params['system'] = [
+            [
+              'type' => 'text',
+              'text' => $system,
+              'cache_control' => ['type' => 'ephemeral'],
+            ],
+          ];
+        }
+        else {
+          $params['system'] = $system;
+        }
       }
-      if (!$this->modelRejectsSamplingParams($model)) {
+
+      $thinking_budget = (int) ($context_extra['thinking_budget'] ?? ($context_extra['thinking']['budget_tokens'] ?? 0));
+      if (!empty($context_extra['thinking']) || $thinking_budget > 0) {
+        if ($thinking_budget <= 0) {
+          $thinking_budget = 2048;
+        }
+        $params['thinking'] = [
+          'type' => 'enabled',
+          'budget_tokens' => $thinking_budget,
+        ];
+        if ((int) $params['max_tokens'] <= $thinking_budget) {
+          $params['max_tokens'] = $thinking_budget + 1024;
+        }
+        $params['temperature'] = 1.0;
+      }
+      elseif (!$this->modelRejectsSamplingParams($model)) {
         $params['temperature'] = max(0.0, min(1.0, (float) $temperature));
       }
 
@@ -418,6 +462,13 @@ class AIAnthropicAdapter extends AIAdapterBase {
       $anthropic_tools = $this->convertToolsToAnthropic($tools);
       $tc_type = ($tool_choice === 'none') ? 'none' : (($tool_choice === 'required') ? 'any' : 'auto');
 
+      // Add ephemeral prompt caching to the final tool definition if tools are present
+      // and prompt caching is requested or there are multiple tools.
+      if (!empty($anthropic_tools) && (!empty($context_extra['prompt_caching']) || count($anthropic_tools) >= 3)) {
+        $last_idx = count($anthropic_tools) - 1;
+        $anthropic_tools[$last_idx]['cache_control'] = ['type' => 'ephemeral'];
+      }
+
       $params = [
         'model'      => $model,
         'max_tokens' => (int) $max_tokens ?: 1024,
@@ -426,7 +477,40 @@ class AIAnthropicAdapter extends AIAdapterBase {
         'tool_choice' => ['type' => $tc_type],
       ];
       if (!empty(trim($system))) {
-        $params['system'] = trim($system);
+        if (!empty($context_extra['prompt_caching']) || strlen(trim($system)) >= 1024) {
+          $params['system'] = [
+            [
+              'type' => 'text',
+              'text' => trim($system),
+              'cache_control' => ['type' => 'ephemeral'],
+            ],
+          ];
+        }
+        else {
+          $params['system'] = trim($system);
+        }
+      }
+
+      $thinking_budget = (int) ($context_extra['thinking_budget'] ?? ($context_extra['thinking']['budget_tokens'] ?? 0));
+      if (!empty($context_extra['thinking']) || $thinking_budget > 0) {
+        if ($thinking_budget <= 0) {
+          $thinking_budget = 2048;
+        }
+        $params['thinking'] = [
+          'type' => 'enabled',
+          'budget_tokens' => $thinking_budget,
+        ];
+        if ((int) $params['max_tokens'] <= $thinking_budget) {
+          $params['max_tokens'] = $thinking_budget + 1024;
+        }
+        $params['temperature'] = 1.0;
+        // Extended thinking only allows tool_choice auto or none.
+        if ($params['tool_choice']['type'] === 'any') {
+          $params['tool_choice'] = ['type' => 'auto'];
+        }
+      }
+      elseif (!$this->modelRejectsSamplingParams($model)) {
+        $params['temperature'] = max(0.0, min(1.0, (float) $temperature));
       }
 
       $response = $this->makeApiRequest('/messages', $params);
@@ -602,17 +686,47 @@ class AIAnthropicAdapter extends AIAdapterBase {
         continue;
       }
 
+      if ($type === 'document') {
+        if (!empty($block['source'])) {
+          $blocks[] = $block;
+        }
+        elseif (!empty($block['data'])) {
+          $blocks[] = [
+            'type' => 'document',
+            'source' => [
+              'type' => 'base64',
+              'media_type' => $block['media_type'] ?? 'application/pdf',
+              'data' => $block['data'],
+            ],
+          ];
+        }
+        continue;
+      }
+
       if ($type === 'image_url') {
         $image_url = $block['image_url']['url'] ?? '';
         if (preg_match('/^data:([^;]+);base64,(.+)$/', $image_url, $matches)) {
-          $blocks[] = [
-            'type' => 'image',
-            'source' => [
-              'type' => 'base64',
-              'media_type' => $matches[1],
-              'data' => $matches[2],
-            ],
-          ];
+          $media_type = $matches[1];
+          if ($media_type === 'application/pdf') {
+            $blocks[] = [
+              'type' => 'document',
+              'source' => [
+                'type' => 'base64',
+                'media_type' => 'application/pdf',
+                'data' => $matches[2],
+              ],
+            ];
+          }
+          else {
+            $blocks[] = [
+              'type' => 'image',
+              'source' => [
+                'type' => 'base64',
+                'media_type' => $media_type,
+                'data' => $matches[2],
+              ],
+            ];
+          }
         }
       }
     }
