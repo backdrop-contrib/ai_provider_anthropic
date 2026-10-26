@@ -38,17 +38,6 @@ class AIAnthropicAdapter extends AIAdapterBase {
   }
 
   /**
-   * Whether a model rejects the sampling parameters.
-   *
-   * Fable 5, Mythos 5, and Opus 4.7/4.8 removed temperature/top_p/top_k —
-   * sending any of them returns a 400. Sonnet 4.6, Opus 4.6 and earlier still
-   * accept them.
-   */
-  protected function modelRejectsSamplingParams(string $model): bool {
-    return (bool) preg_match('/(fable|mythos|opus-4-[78])/i', $model);
-  }
-
-  /**
    * Pull system-role messages out of a shared message array.
    *
    * Anthropic takes the system prompt as a top-level `system` field, not as a
@@ -161,9 +150,7 @@ class AIAnthropicAdapter extends AIAdapterBase {
           ],
         ],
       ];
-      if (!$this->modelRejectsSamplingParams($model)) {
-        $params['temperature'] = max(0.0, min(1.0, (float) $temperature));
-      }
+      $params['temperature'] = max(0.0, min(1.0, (float) $temperature));
 
       if ($stream_response) {
         return $this->handleStreamingResponse($params);
@@ -311,7 +298,7 @@ class AIAnthropicAdapter extends AIAdapterBase {
         }
         $params['temperature'] = 1.0;
       }
-      elseif (!$this->modelRejectsSamplingParams($model)) {
+      else {
         $params['temperature'] = max(0.0, min(1.0, (float) $temperature));
       }
 
@@ -418,16 +405,26 @@ class AIAnthropicAdapter extends AIAdapterBase {
    */
   protected function handleStreamingResponse(array $params) {
     try {
+      $model   = (string) ($params['model'] ?? '');
+      $params  = $this->withoutRejectedParams($model, $params);
       $params['stream'] = TRUE;
       $url     = $this->baseUrl . '/messages';
-      $options = $this->buildRequestOptions($params, [], 'POST', 300);
+      $options = [
+        'method' => 'POST',
+        'headers' => array_merge([
+          'Accept' => 'text/event-stream',
+          'Content-Type' => 'application/json',
+        ], $this->getDefaultHeaders()),
+        'data' => json_encode($params),
+        'timeout' => 300,
+      ];
 
-      return new AIStreamingResponse($url, $options, function ($data) {
+      return $this->buildStreamingResponse($url, $options, function ($data) {
         if (($data['delta']['type'] ?? '') === 'text_delta') {
           return $data['delta']['text'] ?? '';
         }
         return NULL;
-      });
+      }, $this->streamRetryDroppingRejectedParams($model, $params));
     }
     catch (\Exception $e) {
       watchdog('ai_provider_anthropic', 'Streaming error: @error',
@@ -439,8 +436,10 @@ class AIAnthropicAdapter extends AIAdapterBase {
   protected function makeApiRequest($endpoint, array $body) {
     // Only /messages generation calls go through here (model listing has its
     // own fast-fail request); long generations need more than the 30s
-    // makeRequest() default.
-    return $this->makeRequest($this->baseUrl . $endpoint, $body, [], 'POST', 300);
+    // makeRequest() default. Newer models refuse temperature outright.
+    return $this->sendDroppingRejectedParams((string) ($body['model'] ?? ''), $body, function (array $body) use ($endpoint) {
+      return $this->makeRequest($this->baseUrl . $endpoint, $body, [], 'POST', 300);
+    });
   }
 
   /**
@@ -509,7 +508,7 @@ class AIAnthropicAdapter extends AIAdapterBase {
           $params['tool_choice'] = ['type' => 'auto'];
         }
       }
-      elseif (!$this->modelRejectsSamplingParams($model)) {
+      else {
         $params['temperature'] = max(0.0, min(1.0, (float) $temperature));
       }
 
