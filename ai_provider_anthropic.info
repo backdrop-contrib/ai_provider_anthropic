@@ -1,6 +1,7 @@
 name = AI Provider Anthropic
 description = Anthropic Claude provider for the AI module.
 backdrop = 1.x
+php = 8.2
 type = module
 package = AI
 dependencies[] = key
