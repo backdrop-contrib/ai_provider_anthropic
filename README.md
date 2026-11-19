@@ -1,10 +1,12 @@
 # AI Provider Anthropic
 
-Anthropic Claude provider for the Backdrop CMS AI module.
+Connect Claude to Backdrop features that draft, summarize, or analyze content. Compatible Claude models can also interpret images and call tools.
 
 ## Installation
 
-- Install this module using the official [Backdrop CMS instructions](https://backdropcms.org/user-guide/modules).
+Install and enable this module with AI and Key. [Backdrop module installation guide](https://backdropcms.org/user-guide/modules)
+
+Store your service credentials using the Key module. Choose the provider in **Configuration → AI → Settings → Providers**. [Setup and troubleshooting](https://github.com/backdrop-contrib/ai_provider_anthropic/wiki)
 
 ## Issues
 
